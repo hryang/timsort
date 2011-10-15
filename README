@@ -1,0 +1,4 @@
+A C++ version timsort.
+
+Timsort is an adaptive, stable, natural mergesort. It's superfast on many kinds of partially ordered arrays, yet as fast as quick sort on random arrays.
+It has been implemented on python and java. Here is the C++ version.
