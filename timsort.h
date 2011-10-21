@@ -18,7 +18,10 @@
 #define TIMSORT_H
 
 #include <functional>
+#include <algorithm>
 #include <cassert>
+#include <cmath>
+#include <stdint.h>
 
 // ==================
 // Declaration
@@ -38,9 +41,15 @@ class TimSortImpl
 {
 private:
     static const size_t kMaxMinRunLength = 32;  // The maximum minrun length
+
     // Based on the merging strategy, the run length in the stack is a fibonacci sequence.
     // Then 100 deep stack can cover a huge number of elements. That's enough.
     static const size_t kMaxMergeStackSize = 100;
+
+    static const size_t kMinGallop = 7;
+
+    // The initial size of merge area. This value can be changed for performance.
+    static const size_t kInitMergeAreaSize = 256;
 
 public:
     template <typename RandomAccessIterator>
@@ -49,6 +58,7 @@ public:
     template <typename RandomAccessIterator, typename Compare>
     static void Sort(RandomAccessIterator first, RandomAccessIterator last, Compare comp);
 
+private:
     /**
      * The run is [first, last)
      */
@@ -69,14 +79,51 @@ public:
     template <typename RandomAccessIterator>
     struct MergeState
     {
+        size_t mArraySize;  // The input array size
+
         // Maintain a stack for merging
         size_t mNumRunInStack;
         Run<RandomAccessIterator> mStack[TimSortImpl::kMaxMergeStackSize];
 
-        MergeState() : mNumRunInStack(0) {};
+        size_t mMinGallop;
+        
+        // The temporary area for merging two runs.
+        std::vector<typename RandomAccessIterator::value_type> mMergeArea;
+
+        MergeState(size_t arraySize)
+            : mArraySize(arraySize), mNumRunInStack(0), mMinGallop(TimSortImpl::kMinGallop) 
+        {
+            mMergeArea.reserve(TimSortImpl::kInitMergeAreaSize);
+        };
+
+        // Increase the merge area size if necessary.
+        // The size is growed as exponentially to amortize linear time complexity.
+        inline void EnsureMergeAreaSize(uint32_t requiredSize)
+        {
+            if (mMergeArea.size() < requiredSize) {
+                // Compute the smallest power of 2 > requiredSize for 32-bit number
+                uint32_t newSize = requiredSize;
+                newSize |= newSize >> 1;
+                newSize |= newSize >> 2;
+                newSize |= newSize >> 4;
+                newSize |= newSize >> 8;
+                newSize |= newSize >> 16;
+                newSize++;
+
+                // Unlucky, the input requiredSize is too large (>= 2^31)
+                // we can not round it up to power of 2.
+                if (newSize <= 0) {
+                    newSize = requiredSize;
+                } else {
+                    // We need array_size/2 merging area at most.
+                    newSize = std::min<uint32_t>(newSize, mArraySize >> 1);
+                }
+                
+                mMergeArea.reserve(newSize);
+            }
+        }
     };
 
-private:
     template <typename RandomAccessIterator, typename Compare>
     static void BinaryInsertionSort(RandomAccessIterator first, RandomAccessIterator last, Compare comp);
 
@@ -128,6 +175,50 @@ private:
     template <typename RandomAccessIterator, typename Compare>
     static void MergeAt(MergeState<RandomAccessIterator> &state, size_t stackPos, Compare comp);
 
+    /**
+     * Merge two adjacent runs in place in stable way. 
+     * This function is called only when:
+     * 1. The size of range A [firstA, lastA) smaller than or equal to the size of range B [firstB, lastB) AND
+     * 2. The first element of A is greater than first element of B AND
+     * 3. The last element of A is greater than last element of B.
+     */
+    template <typename RandomAccessIterator, typename Compare>
+    static void MergeLow(
+            MergeState<RandomAccessIterator> &state, RandomAccessIterator firstA, RandomAccessIterator lastA,
+            RandomAccessIterator firstB, RandomAccessIterator lastB, Compare comp);
+
+    /**
+     * Merge two adjacent runs in place in stable way. 
+     * This function is called only when:
+     * 1. The size of range A [firstA, lastA) larger than or equal to the size of range B [firstB, lastB) AND
+     * 2. The first element of A is greater than first element of B AND
+     * 3. The last element of A is greater than last element of B.
+     */
+    template <typename RandomAccessIterator, typename Compare>
+    static void MergeHigh(
+            MergeState<RandomAccessIterator> &state, RandomAccessIterator firstA, RandomAccessIterator lastA,
+            RandomAccessIterator firstB, RandomAccessIterator lastB, Compare comp);
+
+    /**
+     * Returns an iterator pointing to the first element in the sorted range [first,last) which does not compare less than value.
+     * The semantic of this function is the same as std::lower_bound().
+     * @param hint The position where to begin the search. The closer hint is to the result, the faster this function will run.
+     */
+    template <typename RandomAccessIterator, typename Compare>
+    static RandomAccessIterator GallopLeft(
+            RandomAccessIterator first, RandomAccessIterator last, RandomAccessIterator hint,
+            const typename RandomAccessIterator::value_type &value, Compare comp);
+
+    /**
+     * Returns an iterator pointing to the first element in the sorted range [first,last) which compares greater than value.
+     * The semantic of this function is the same as std::upper_bound().
+     * @param hint The position where to begin the search. The closer hint is to the result, the faster this function will run.
+     */
+    template <typename RandomAccessIterator, typename Compare>
+    static RandomAccessIterator GallopRight(
+            RandomAccessIterator first, RandomAccessIterator last, RandomAccessIterator hint,
+            const typename RandomAccessIterator::value_type &value, Compare comp);
+
     // for unit test
     friend class TimSortUT;
 };
@@ -141,13 +232,9 @@ void TimSortImpl::BinaryInsertionSort(RandomAccessIterator first, RandomAccessIt
         // The sequence [first, i) is in order. Binary search the right position
         typename RandomAccessIterator::value_type value = *i;
         RandomAccessIterator j = std::upper_bound(first, i, value, comp);
-        RandomAccessIterator k;
 
-        for (k = i - 1; k >= j; --k) {
-            *(k + 1) = *k;
-        }
-
-        *(k + 1) = value;
+        std::copy_backward(j, i, i + 1);
+        *j = value;
     }
 }
 
@@ -240,6 +327,7 @@ void TimSortImpl::MergeAt(MergeState<RandomAccessIterator> &state, size_t stackP
 {
     assert(stackPos == state.mNumRunInStack - 2 || stackPos == state.mNumRunInStack - 3);
 
+#if 0
     std::vector<typename RandomAccessIterator::value_type> tmpStorage;
     tmpStorage.resize(state.mStack[stackPos].GetLength() + state.mStack[stackPos + 1].GetLength());
     std::merge(
@@ -247,14 +335,448 @@ void TimSortImpl::MergeAt(MergeState<RandomAccessIterator> &state, size_t stackP
         state.mStack[stackPos + 1].first, state.mStack[stackPos + 1].last,
         tmpStorage.begin(), comp);
     std::copy(tmpStorage.begin(), tmpStorage.end(), state.mStack[stackPos].first);
+#endif
+
+    RandomAccessIterator firstA = state.mStack[stackPos].first;
+    RandomAccessIterator lastA = state.mStack[stackPos].last;
+    RandomAccessIterator firstB = state.mStack[stackPos + 1].first;
+    RandomAccessIterator lastB = state.mStack[stackPos + 1].last;
+    size_t lengthA = 0;
+    size_t lengthB = 0;
 
     // Adjust the stack entries
     state.mStack[stackPos].last = state.mStack[stackPos + 1].last;
-    // If we merge A and B, then we need adjust C to B's position.
+    // If we merge the 3rd-last run and 2sec-last run, then adjust 1st-last run to the 2sec-last run's position.
     if (stackPos == state.mNumRunInStack - 3) {
         state.mStack[stackPos + 1] = state.mStack[stackPos + 2];
     }
     --state.mNumRunInStack;
+
+    // Figure out where the first element of B goes in A.
+    // The prior elements of A can be ignored since they are already in place.
+    RandomAccessIterator pA = GallopRight(firstA, lastA, firstA, *firstB, comp);
+    lengthA = distance(pA, lastA);
+    if (lengthA == 0) {
+        return;
+    }
+
+    // Figure out where the last element of A goes in B.
+    // The subsequent elements of B can be ignored since they are already in place.
+    RandomAccessIterator pB = GallopLeft(firstB, lastB, lastB - 1, *(lastA - 1), comp);
+    lengthB = distance(firstB, pB);
+    if (lengthB == 0) {
+        return;
+    }
+
+    if (lengthA <= lengthB) {
+        MergeLow(state, pA, lastA, firstB, pB, comp);
+    } else {
+        MergeHigh(state, pA, lastA, firstB, pB, comp);
+    }
+}
+
+template <typename RandomAccessIterator, typename Compare>
+void TimSortImpl::MergeLow(
+        TimSortImpl::MergeState<RandomAccessIterator> &state, RandomAccessIterator firstA, RandomAccessIterator lastA,
+        RandomAccessIterator firstB, RandomAccessIterator lastB, Compare comp)
+{
+    // The number of left elems have not been merged yet. Init to the input two arrays' size.
+    typename RandomAccessIterator::difference_type lengthA = distance(firstA, lastA);
+    typename RandomAccessIterator::difference_type lengthB = distance(firstB, lastB);
+
+    assert(0 < lengthA && lengthA <= lengthB &&   // A must be smaller than B AND
+           lastA == firstB &&                     // A and B are adjacent AND
+           comp(*firstB, *firstA) &&              // first_elem_of_A > first_elem_of_B AND
+           comp(*(lastB - 1), *(lastA - 1)));     // last_elem_of_A > last_elem_of_B
+
+    state.EnsureMergeAreaSize(lengthA);
+
+    // Copy the run A (the smaller one) into the temporary merge area
+    std::copy(firstA, lastA, state.mMergeArea.begin());
+
+    RandomAccessIterator cursorA = state.mMergeArea.begin();  // point to the first of A, now in the merge area
+    lastA = cursorA + lengthA;                                // point to the last of A, now in the merge area
+    RandomAccessIterator cursorB = firstB;                    // point to the first of B
+    RandomAccessIterator cursorDest = firstA;                 // point to the dest area, i.e. the original A's position
+
+    // Move first element of run B in the dest area since caller guarantee that A[0] > B[0]
+    *cursorDest = *cursorB;
+    ++cursorDest;
+    ++cursorB;
+    --lengthB;
+
+    // Use local one for performance.
+    size_t minGallop = state.mMinGallop;
+
+    // Hanle degenerate case.
+    // If now B is empty, this implies that A is also empty since lengthA <= lengthB
+    if (lengthB == 0) {
+        goto LABEL_COPY_MERGE_AREA_TO_DEST;
+    }
+
+    // If lengthA is 1, then move B to A and append A[0].
+    if (lengthA == 1) {
+        goto LABEL_COPY_B_TO_DEST_AND_APPEND_A;
+    }
+
+    while (1) {
+        // Do the straitforward merging until one run wins consistently.
+        uint32_t countA = 0;   // number of times run A won
+        uint32_t countB = 0;   // number of times run B won
+
+        // one-pair-at-a-time mode
+        do {
+            if (comp(*cursorB, *cursorA)) {     // Current elem of B is less than current elem of A
+                *cursorDest = *cursorB;
+                ++cursorDest;
+                ++cursorB;
+                --lengthB;
+                countA = 0;
+                ++countB;
+
+                if (lengthB == 0) {
+                    goto LABEL_COPY_MERGE_AREA_TO_DEST;
+                }
+            } else {                            // Current elem of A less than or equal to current elem of B
+                *cursorDest = *cursorA;
+                ++cursorDest;
+                ++cursorA;
+                --lengthA;
+                ++countA;
+                countB = 0;
+
+                if (lengthA == 1) {
+                    goto LABEL_COPY_B_TO_DEST_AND_APPEND_A;
+                }
+            }
+        } while ((countA | countB) < minGallop);  // if countA > 0 then countB == 0, vice versa
+
+        // Switch to the galloping mode and continue galloping until neither run appears to be winning consistently any more.
+        RandomAccessIterator p;
+        do {
+            assert(lengthA > 1 && lengthB > 0);
+
+            // Find the current element of B (pointed by cursorB)'s position in range [cursorA, lastA) in gallop way.
+            p = GallopRight(cursorA, lastA, cursorA, *cursorB, comp);
+            countA = distance(cursorA, p);
+            if (countA != 0) {
+                std::copy(cursorA, p, cursorDest);
+                cursorDest += countA;
+                cursorA += countA;
+                lengthA -= countA;
+
+                if (lengthA == 0) {
+                    // All B's elems must have been merged since the last element of A is greater than all elems of B.
+                    assert(lengthB == 0);
+                    return;
+                }
+
+                if (lengthA == 1) {
+                    goto LABEL_COPY_B_TO_DEST_AND_APPEND_A;
+                }
+            }
+            *cursorDest = *cursorB;
+            ++cursorDest;
+            ++cursorB;
+            if (--lengthB == 0) {
+                goto LABEL_COPY_MERGE_AREA_TO_DEST;
+            }
+
+            // Find the current element of A (pointed by cursor A)'s position in range [cursorB, lastB) in gallop way.
+            p = GallopLeft(cursorB, lastB, cursorB, *cursorA, comp);
+            countB = distance(cursorB, p);
+            if (countB != 0) {
+                std::copy(cursorB, p, cursorDest);
+                cursorDest += countB;
+                cursorB += countB;
+                lengthB -= countB;
+
+                if (lengthB == 0) {
+                    assert(lengthA > 0);
+                    goto LABEL_COPY_MERGE_AREA_TO_DEST;
+                }
+            }
+            *cursorDest = *cursorA;
+            ++cursorDest;
+            ++cursorA;
+            --lengthA;
+
+            if (lengthA == 1) {
+                goto LABEL_COPY_B_TO_DEST_AND_APPEND_A;
+            }
+
+            // Decrease the minGallop until it reaches 1.
+            // The computation of minGallop is heuristic.
+            // The longer we stay in galloping mode this time, the eariler we switch to the gallop mode next time.
+            minGallop -= (minGallop > 1);
+        } while (countA >= kMinGallop || countB >= kMinGallop);
+
+        ++minGallop;  // penalize for leaving gallop mode.
+    } // end of while (1)
+
+    state.mMinGallop = minGallop;
+
+LABEL_COPY_MERGE_AREA_TO_DEST:
+    assert(lengthA > 0 && lengthB == 0);
+    std::copy(cursorA, cursorA + lengthA, cursorDest);
+    return;
+
+LABEL_COPY_B_TO_DEST_AND_APPEND_A:
+    assert(lengthA == 1 && lengthB > 0);
+    std::copy(cursorB, cursorB + lengthB, cursorDest);
+    cursorDest += lengthB;
+    *cursorDest = *cursorA;
+    return;
+}
+
+template <typename RandomAccessIterator, typename Compare>
+void TimSortImpl::MergeHigh(
+        TimSortImpl::MergeState<RandomAccessIterator> &state, RandomAccessIterator firstA, RandomAccessIterator lastA,
+        RandomAccessIterator firstB, RandomAccessIterator lastB, Compare comp)
+{
+    // The number of left elems have not been merged yet. Init to the input two arrays' size.
+    typename RandomAccessIterator::difference_type lengthA = distance(firstA, lastA);
+    typename RandomAccessIterator::difference_type lengthB = distance(firstB, lastB);
+
+    assert(0 < lengthB && lengthA >= lengthB &&   // A must be larger than B AND
+           lastA == firstB &&                     // A and B are adjacent AND
+           comp(*firstB, *firstA) &&              // first_elem_of_A > first_elem_of_B AND
+           comp(*(lastB - 1), *(lastA - 1)));     // last_elem_of_A > last_elem_of_B
+
+    state.EnsureMergeAreaSize(lengthB);
+
+    // Copy run B to temprary array
+    std::copy(firstB, lastB, state.mMergeArea.begin());
+
+    // Merge the two arrays from RIGHT to LEFT
+    //                 A                 original  B              merge area (now contains B)
+    //   +----------------------------+---------------+               +-----------------+
+    //    ^                          ^               ^                 ^               ^
+    //  firstA                    cursorA        cursorDest          firsB           cursorB
+
+    RandomAccessIterator cursorA = lastA - 1;
+    firstB = state.mMergeArea.begin();
+    RandomAccessIterator cursorB = state.mMergeArea.begin() + lengthB - 1;
+    RandomAccessIterator cursorDest = lastB - 1;
+
+    // Move the last element of A and deal with degenerate 
+    *cursorDest = *cursorA;
+    --cursorDest;
+    --cursorA;
+    --lengthA;
+
+    // Use local one for performance.
+    size_t minGallop = state.mMinGallop;
+
+    if (lengthA == 0) {
+        goto LABEL_COPY_MERGE_AREA_TO_DEST;
+    }
+
+    if (lengthB == 1) {
+        goto LABEL_COPY_A_TO_DEST_AND_PREPEND_B;
+    }
+
+    while (1) {
+        // Do the straitforward merging until one run wins consistently.
+        size_t countA = 0;
+        size_t countB = 0;
+
+        // one-pair-a-time mode
+        do {
+            assert(lengthA > 0 || lengthB > 1);
+
+            if (comp(*cursorB, *cursorA)) {
+                *cursorDest = *cursorA;
+                --cursorDest;
+                --cursorA;
+                --lengthA;
+                ++countA;
+                countB = 0;
+
+                if (lengthA == 0) {
+                    goto LABEL_COPY_MERGE_AREA_TO_DEST;
+                }
+            } else {
+                *cursorDest = *cursorB;
+                --cursorDest;
+                --cursorB;
+                --lengthB;
+                countA = 0;
+                ++countB;
+
+                if (lengthB == 1) {
+                    goto LABEL_COPY_A_TO_DEST_AND_PREPEND_B;
+                }
+            }
+        } while ((countA | countB) < minGallop);
+
+        // Switch to the galloping mode and continue galloping until neither run appears to be winning consistently any more.
+        RandomAccessIterator p;
+        do {
+            assert(lengthA > 0 && lengthB > 1);
+
+            // Find the current element of B (pointed by cursorB)'s position in range [firstA, cursorA + 1) in gallop way.
+            p = GallopRight(firstA, cursorA + 1, cursorA, *cursorB, comp);
+            countA = distance(p, cursorA + 1);
+            if (countA != 0) {
+                std::copy_backward(p, cursorA + 1, cursorDest + 1);
+                cursorDest -= countA;
+                cursorA -= countA;
+                lengthA -= countA;
+
+                if (lengthA == 0) {
+                    // Some B's elements must be left since firstA > firstB.
+                    assert(lengthB > 0);
+                    goto LABEL_COPY_MERGE_AREA_TO_DEST;
+                }
+            }
+            *cursorDest = *cursorB;
+            --cursorDest;
+            --cursorB;
+            --lengthB;
+
+            if (lengthB == 1) {
+                goto LABEL_COPY_A_TO_DEST_AND_PREPEND_B;
+            }
+
+            // Find the current element of A (pointed by cursor A)'s position in range [cursorB, lastB) in gallop way.
+            p = GallopLeft(firstB, cursorB + 1, cursorB, *cursorA, comp);
+            countB = distance(p, cursorB + 1);
+            if (countB != 0) {
+                std::copy_backward(p, cursorB + 1, cursorDest + 1);
+                cursorDest -= countB;
+                cursorB -= countB;
+                lengthB -= countB;
+
+                if (lengthB == 0) {
+                    // A must be empty since firstA > firstB
+                    assert(lengthA == 0);
+                    return;
+                }
+                if (lengthB == 1) {
+                    goto LABEL_COPY_A_TO_DEST_AND_PREPEND_B;
+                }
+            }
+            *cursorDest = *cursorA;
+            --cursorDest;
+            --cursorA;
+            --lengthA;
+
+            if (lengthA == 0) {
+                goto LABEL_COPY_MERGE_AREA_TO_DEST;
+            }
+
+            // Decrease the minGallop until it reaches 1.
+            // The computation of minGallop is heuristic.
+            // The longer we stay in galloping mode this time, the eariler we switch to the gallop mode next time.
+            minGallop -= (minGallop > 1);
+        } while (countA >= kMinGallop || countB >= kMinGallop);
+
+        ++minGallop;  // penalize for leaving gallop mode.
+    } // end of while (1)
+
+    state.mMinGallop = minGallop;
+
+LABEL_COPY_MERGE_AREA_TO_DEST:
+    assert(lengthA == 0 && lengthB > 0);
+    std::copy_backward(firstB, cursorB + 1, cursorDest + 1);
+    return;
+
+LABEL_COPY_A_TO_DEST_AND_PREPEND_B:
+    assert(lengthB == 1 && lengthA > 0);
+    std::copy_backward(firstA, cursorA + 1, cursorDest + 1);
+    cursorDest -= lengthA;
+    *cursorDest = *cursorB;
+    return;
+}
+
+template <typename RandomAccessIterator, typename Compare>
+RandomAccessIterator TimSortImpl::GallopLeft(
+        RandomAccessIterator first, RandomAccessIterator last, RandomAccessIterator hint,
+        const typename RandomAccessIterator::value_type &value, Compare comp)
+{
+    assert(first <= hint && hint < last);
+
+    RandomAccessIterator begin;
+    RandomAccessIterator end;
+
+    if (comp(*hint, value) == false) {  // value <= hint
+        // Exponential seraching from right to left to find the range value belongs to, where *begin < value <= *end
+        // The range legths grows as power of 2. i.e. The seraching ranges are: 
+        // [hint-1, hint), [hint-3, hint-1), [hint-7, hint-3) ... [hint-2^k-1, hint-2^(k-1)-1).
+        size_t k;
+        for (k = 1, begin = hint - 1, end = hint;
+             begin > first && comp(*begin, value) == false; ++k) {
+            end = begin;
+            // Note: 1LL << k may be overflow then become negative. 
+            //       But before the overflow, the loop has been terminated by condition begin > first
+            //       since it's impossible to have a so huge array in reality (The array size is at least greater than (1 << 62)).
+            begin = begin - (1LL << k);
+        }
+        begin = begin >= first ? begin : first;
+    } else {                            // value > hint
+        // Exponential seraching from left to right to find the range value belongs to, where *begin < value <= *end
+        // The range legths grows as power of 2. i.e. The seraching ranges are: 
+        // [hint-1, hint), [hint-3, hint-1), [hint-7, hint-3) ... [hint-2^k-1, hint-2^(k-1)-1).
+        size_t k;
+        for (k = 1, begin = hint, end = hint + 1;
+             end < last && comp(*end, value); ++k) {
+            begin = end;
+            // XXX Should we need care about the overflow of (end + huge_integer) for 32-bits OS?
+            end = end + (1LL << k);
+        }
+        end = end <= last ? end : last;
+    }
+    assert(first <= begin && begin <= end && end <= last);
+
+    // Now binary search the value in the range [begin, end)
+    // XXX: It's possible that begin and end are equal. Then we expect upper_bound return the begin iterator.
+    //      It's OK for gcc version stl.
+    return lower_bound(begin, end, value, comp);
+}
+
+template <typename RandomAccessIterator, typename Compare>
+RandomAccessIterator TimSortImpl::GallopRight(
+        RandomAccessIterator first, RandomAccessIterator last, RandomAccessIterator hint,
+        const typename RandomAccessIterator::value_type &value, Compare comp)
+{
+    assert(first <= hint && hint < last);
+
+    RandomAccessIterator begin;
+    RandomAccessIterator end;
+    if (comp(value, *hint)) {  // value < hint
+        // Exponential seraching from right to left to find the range value belongs to, where *begin <= value < *end
+        // The range legths grows as power of 2. i.e. The seraching ranges are: 
+        // [hint-1, hint), [hint-3, hint-1), [hint-7, hint-3) ... [hint-2^k-1, hint-2^(k-1)-1).
+        size_t k;
+        for (k = 1, begin = hint - 1, end = hint;
+             begin > first && comp(value, *begin); ++k) {
+            end = begin;
+            // Note: 1LL << k may be overflow then become negative. 
+            //       But before the overflow, the loop has been terminated by condition begin > first
+            //       since it's impossible to have a so huge array in reality (The array size is at least greater than (1 << 62)).
+            begin = begin - (1LL << k);
+        }
+        begin = begin >= first ? begin : first;
+    } else {                   // value >= hint
+        // Exponential seraching from left to right to find the range value belongs to, where *begin <= value < *end
+        // The range legths grows as power of 2. i.e. The seraching ranges are: 
+        // [hint, hint+1), [hint+1, hint+3), [hint+3, hint+7) ... [hint+2^(k-1)-1, hint+2^k-1).
+        size_t k;
+        for (k = 1, begin = hint, end = hint + 1;
+             end < last && comp(value, *end) == false; ++k) {
+            begin = end;
+            // XXX Should we need care about the overflow of (end + huge_integer) for 32-bits OS?
+            end = end + (1LL << k);
+        }
+        end = end <= last ? end : last;
+    }
+    assert(first <= begin && begin <= end && end <= last);
+
+    // Now binary search the value in the range [begin, end)
+    // XXX: It's possible that begin and end are equal. Then we expect upper_bound return the begin iterator.
+    //      It's OK for gcc version stl.
+    return upper_bound(begin, end, value, comp);
 }
 
 template <typename RandomAccessIterator, typename Compare>
@@ -264,7 +786,7 @@ void TimSortImpl::Sort(RandomAccessIterator first, RandomAccessIterator last, Co
 
     size_t numElems = distance(first, last);
     size_t minRunLength = CalcMinRunLength(numElems);
-    MergeState<RandomAccessIterator> mergeState;
+    MergeState<RandomAccessIterator> mergeState(numElems);
 
     Run<RandomAccessIterator> run;
     RandomAccessIterator next = first;
